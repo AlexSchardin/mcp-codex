@@ -5,9 +5,6 @@
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { writeFileSync, mkdirSync, rmSync, existsSync } from 'fs';
-import { randomUUID } from 'crypto';
-import { tmpdir } from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -45,11 +42,8 @@ export default async function handler(req, res) {
     return;
   }
 
-  // Create a unique working directory for this request
-  const workDir = join(tmpdir(), 'mcp-' + randomUUID());
-  mkdirSync(workDir, { recursive: true });
-
   // Parse credentials from Authorization header
+  // Credentials include both user tokens (accessToken, refreshToken) and can include app credentials
   const authHeader = req.headers.authorization || '';
   let credentials = {};
 
@@ -62,34 +56,31 @@ export default async function handler(req, res) {
     }
   }
 
-  // Write credentials to config file (for file-based credential loading)
-  // The spotify-mcp-server expects spotify-config.json
-  const configPath = join(workDir, 'spotify-config.json');
-  writeFileSync(configPath, JSON.stringify({
-    accessToken: credentials.accessToken || '',
-    refreshToken: credentials.refreshToken || '',
-    // These would be provided by app credentials in production
-    clientId: process.env.SPOTIFY_CLIENT_ID || '',
-    clientSecret: process.env.SPOTIFY_CLIENT_SECRET || '',
-    redirectUri: 'http://localhost:8888/callback'
-  }, null, 2));
+  // Build environment with ALL credentials injected
+  // This allows the MCP server to be completely stateless - all config comes from the request
+  // App-level credentials (clientId, clientSecret) come from Vercel env vars as fallback
+  const env = {
+    ...process.env,
+    // User's OAuth tokens (per-request, from Authorization header)
+    SPOTIFY_ACCESS_TOKEN: credentials.accessToken || '',
+    SPOTIFY_REFRESH_TOKEN: credentials.refreshToken || '',
+    // App credentials - prefer from request, fallback to Vercel env vars
+    SPOTIFY_CLIENT_ID: credentials.clientId || process.env.SPOTIFY_CLIENT_ID || '',
+    SPOTIFY_CLIENT_SECRET: credentials.clientSecret || process.env.SPOTIFY_CLIENT_SECRET || '',
+    SPOTIFY_REDIRECT_URI: credentials.redirectUri || process.env.SPOTIFY_REDIRECT_URI || 'http://localhost:8888/callback',
+    // Generic MCP credential env vars (for servers that use standard naming)
+    MCP_ACCESS_TOKEN: credentials.accessToken || '',
+    MCP_REFRESH_TOKEN: credentials.refreshToken || '',
+    MCP_CLIENT_ID: credentials.clientId || process.env.MCP_CLIENT_ID || '',
+    MCP_CLIENT_SECRET: credentials.clientSecret || process.env.MCP_CLIENT_SECRET || '',
+  };
 
   // Spawn the MCP server from the build directory
+  // The patched utils.ts reads credentials from env vars, making the server stateless
   const serverPath = join(__dirname, '..', 'build', 'index.js');
 
   return new Promise((resolve) => {
-    const cleanup = () => {
-      try {
-        if (existsSync(workDir)) {
-          rmSync(workDir, { recursive: true, force: true });
-        }
-      } catch {
-        // Ignore cleanup errors
-      }
-    };
-
     const timeout = setTimeout(() => {
-      cleanup();
       res.status(504).json({
         jsonrpc: '2.0',
         error: {
@@ -106,8 +97,7 @@ export default async function handler(req, res) {
 
     const serverProcess = spawn('node', [serverPath], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: workDir,  // Run in the work directory where config file is
-      env: { ...process.env }
+      env
     });
 
     serverProcess.stdout.on('data', (data) => {
@@ -120,7 +110,6 @@ export default async function handler(req, res) {
 
     serverProcess.on('close', (code) => {
       clearTimeout(timeout);
-      cleanup();
 
       // Parse the response - MCP servers output JSON-RPC on stdout
       const lines = responseData.trim().split('\n');
@@ -153,7 +142,6 @@ export default async function handler(req, res) {
 
     serverProcess.on('error', (err) => {
       clearTimeout(timeout);
-      cleanup();
       res.status(500).json({
         jsonrpc: '2.0',
         error: {
